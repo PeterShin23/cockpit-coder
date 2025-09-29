@@ -5,7 +5,7 @@ import { Button } from '../components/ui/Button'
 import { getConnectionInfo } from '../lib/storage'
 import { WebSocketProvider, useWebSocket } from '../components/WebSocketProvider'
 
-interface Message {
+type Message = {
   id: string
   type: 'user' | 'agent' | 'system' | 'confirmation'
   content: string
@@ -13,7 +13,7 @@ interface Message {
   status?: 'pending' | 'sent' | 'received' | 'confirmed' | 'cancelled'
 }
 
-interface ChatScreenProps {
+type ChatScreenProps = {
   navigation?: any
 }
 

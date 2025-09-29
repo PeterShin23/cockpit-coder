@@ -32,9 +32,18 @@ export function WebSocketProvider({ children, endpoint, onMessage }: WebSocketPr
           throw new Error('No connection info available')
         }
 
-        const url = `${endpoint}?sessionId=${connectionInfo.sessionId}&token=${connectionInfo.token}`
+        // Determine which WebSocket URL to use based on connection info
+        let wsUrl: string;
+        if (connectionInfo.ws.host && connectionInfo.ws.client) {
+          // Relay mode - use client WebSocket with resumeSeq support
+          const resumeSeq = 0; // TODO: Implement resume sequence logic
+          wsUrl = `${connectionInfo.ws.client}?sessionId=${connectionInfo.sessionId}&token=${connectionInfo.token}&resumeSeq=${resumeSeq}`
+        } else {
+          // Local mode - use the provided endpoint
+          wsUrl = `${endpoint}?sessionId=${connectionInfo.sessionId}&token=${connectionInfo.token}`
+        }
         
-        const ws = new WebSocket(url)
+        const ws = new WebSocket(wsUrl)
         wsRef.current = ws
 
         ws.onopen = () => {

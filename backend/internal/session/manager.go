@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -9,17 +10,6 @@ import (
 
 	"github.com/PeterShin23/cockpit-coder/backend/internal/auth"
 )
-
-// Session represents a user session
-type Session struct {
-	ID        string    `json:"id"`
-	Repo      string    `json:"repo"`
-	Label     string    `json:"label"`
-	Via       string    `json:"via"`
-	CreatedAt time.Time `json:"createdAt"`
-	ExpiresAt time.Time `json:"expiresAt"`
-	Token     string    `json:"token"`
-}
 
 // Task represents a coding task
 type Task struct {
@@ -41,25 +31,124 @@ type Patch struct {
 	Patch string `json:"patch"`
 }
 
-// Manager handles session and task management
-type Manager struct {
+// MemoryManager handles session and task management
+type MemoryManager struct {
 	sessions map[string]*Session
 	tasks    map[string]*Task
 	mu       sync.RWMutex
 }
 
 // NewMemoryManager creates a new in-memory session manager
-func NewMemoryManager() *Manager {
-	return &Manager{
+func NewMemoryManager() *MemoryManager {
+	manager := &MemoryManager{
 		sessions: make(map[string]*Session),
 		tasks:    make(map[string]*Task),
 	}
+
+	// Start cleanup goroutine
+	go manager.cleanupExpiredSessions()
+
+	return manager
 }
 
-// CreateSession creates a new session
-func (m *Manager) CreateSession(repo, label, via string) (string, string, error) {
+// Create creates a new session
+func (m *MemoryManager) Create(ctx context.Context, repo string, ttl time.Duration) (Session, error) {
 	sessionID := generateID()
-	token, err := auth.GenerateToken(sessionID)
+
+	session := &Session{
+		ID:        sessionID,
+		Repo:      repo,
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(ttl),
+	}
+
+	m.mu.Lock()
+	m.sessions[sessionID] = session
+	m.mu.Unlock()
+
+	return *session, nil
+}
+
+// Get retrieves a session by ID
+func (m *MemoryManager) Get(ctx context.Context, id string) (Session, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	session, exists := m.sessions[id]
+	if !exists {
+		return Session{}, false
+	}
+
+	if time.Now().After(session.ExpiresAt) {
+		return Session{}, false
+	}
+
+	return *session, true
+}
+
+// Touch updates the session's expiration time
+func (m *MemoryManager) Touch(ctx context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	session, exists := m.sessions[id]
+	if !exists {
+		return errors.New("session not found")
+	}
+
+	session.ExpiresAt = time.Now().Add(24 * time.Hour)
+	return nil
+}
+
+// End removes a session
+func (m *MemoryManager) End(ctx context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.sessions, id)
+	return nil
+}
+
+// cleanupExpiredSessions removes expired sessions periodically
+func (m *MemoryManager) cleanupExpiredSessions() {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		m.mu.Lock()
+		now := time.Now()
+		for id, session := range m.sessions {
+			if now.After(session.ExpiresAt) {
+				delete(m.sessions, id)
+			}
+		}
+		m.mu.Unlock()
+	}
+}
+
+// generateID creates a random ID
+func generateID() string {
+	bytes := make([]byte, 16)
+	rand.Read(bytes)
+	return hex.EncodeToString(bytes)
+}
+
+// Legacy methods for compatibility with existing code
+func (m *MemoryManager) CreateSession(repo, label, via string) (string, string, error) {
+	sessionID := generateID()
+	
+	var token string
+	var err error
+	
+	if via == "relay" {
+		// Generate relay-compatible token
+		// Use "t_demo" as default tenant ID for demo purposes
+		token, err = auth.GenerateRelayToken(sessionID, "t_demo", 86400) // 24 hours
+	} else {
+		// Generate standard local token
+		token, err = auth.GenerateToken(sessionID)
+	}
+	
 	if err != nil {
 		return "", "", err
 	}
@@ -67,11 +156,8 @@ func (m *Manager) CreateSession(repo, label, via string) (string, string, error)
 	session := &Session{
 		ID:        sessionID,
 		Repo:      repo,
-		Label:     label,
-		Via:       via,
 		CreatedAt: time.Now(),
 		ExpiresAt: time.Now().Add(24 * time.Hour),
-		Token:     token,
 	}
 
 	m.mu.Lock()
@@ -81,8 +167,7 @@ func (m *Manager) CreateSession(repo, label, via string) (string, string, error)
 	return sessionID, token, nil
 }
 
-// GetSession retrieves a session by ID
-func (m *Manager) GetSession(sessionID string) (*Session, error) {
+func (m *MemoryManager) GetSession(sessionID string) (*Session, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -98,8 +183,7 @@ func (m *Manager) GetSession(sessionID string) (*Session, error) {
 	return session, nil
 }
 
-// CreateTask creates a new task for a session
-func (m *Manager) CreateTask(sessionID, instruction, branch string, context map[string]interface{}, agent string) (string, error) {
+func (m *MemoryManager) CreateTask(sessionID, instruction, branch string, context map[string]interface{}, agent string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -125,8 +209,7 @@ func (m *Manager) CreateTask(sessionID, instruction, branch string, context map[
 	return taskID, nil
 }
 
-// GetTask retrieves a task by ID
-func (m *Manager) GetTask(taskID string) (*Task, error) {
+func (m *MemoryManager) GetTask(taskID string) (*Task, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -138,8 +221,7 @@ func (m *Manager) GetTask(taskID string) (*Task, error) {
 	return task, nil
 }
 
-// GetTaskPatches retrieves patches for a task
-func (m *Manager) GetTaskPatches(taskID string) ([]Patch, error) {
+func (m *MemoryManager) GetTaskPatches(taskID string) ([]Patch, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -151,8 +233,7 @@ func (m *Manager) GetTaskPatches(taskID string) ([]Patch, error) {
 	return task.Patches, nil
 }
 
-// ApplyTaskPatches applies selected patches to a task
-func (m *Manager) ApplyTaskPatches(taskID string, selections []map[string]interface{}, commitMessage string) error {
+func (m *MemoryManager) ApplyTaskPatches(taskID string, selections []map[string]interface{}, commitMessage string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -169,8 +250,7 @@ func (m *Manager) ApplyTaskPatches(taskID string, selections []map[string]interf
 	return nil
 }
 
-// UpdateTaskStatus updates the status of a task
-func (m *Manager) UpdateTaskStatus(taskID, status string) error {
+func (m *MemoryManager) UpdateTaskStatus(taskID, status string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -184,8 +264,7 @@ func (m *Manager) UpdateTaskStatus(taskID, status string) error {
 	return nil
 }
 
-// AddPatchesToTask adds patches to a task
-func (m *Manager) AddPatchesToTask(taskID string, patches []Patch) error {
+func (m *MemoryManager) AddPatchesToTask(taskID string, patches []Patch) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -197,11 +276,4 @@ func (m *Manager) AddPatchesToTask(taskID string, patches []Patch) error {
 	task.Patches = append(task.Patches, patches...)
 	task.UpdatedAt = time.Now()
 	return nil
-}
-
-// generateID creates a random ID
-func generateID() string {
-	bytes := make([]byte, 16)
-	rand.Read(bytes)
-	return hex.EncodeToString(bytes)
 }

@@ -10,8 +10,10 @@ interface ConnectionInfo {
   sessionId: string
   token: string
   ws: {
-    pty: string
-    events: string
+    pty?: string
+    events?: string
+    host?: string
+    client?: string
   }
   apiBase: string
   expiresAt: string
@@ -48,11 +50,26 @@ export function QRConnectScreen({ navigation }: { navigation?: any }) {
         throw new Error('Invalid QR code format')
       }
 
+      // Check if we have either local or relay WebSocket URLs
+      const hasLocalWS = connectionData.ws.pty && connectionData.ws.events;
+      const hasRelayWS = connectionData.ws.host && connectionData.ws.client;
+      
+      if (!hasLocalWS && !hasRelayWS) {
+        throw new Error('Invalid WebSocket configuration in QR code')
+      }
+
       // Store connection info
       await setItem('connectionInfo', JSON.stringify(connectionData))
       
-      // Validate connection by opening events WebSocket
-      const ws = new WebSocket(`${connectionData.ws.events}?sessionId=${connectionData.sessionId}&token=${connectionData.token}`)
+      // Validate connection by opening appropriate WebSocket
+      let ws: WebSocket;
+      if (hasLocalWS) {
+        // Local mode - connect to events WebSocket
+        ws = new WebSocket(`${connectionData.ws.events}?sessionId=${connectionData.sessionId}&token=${connectionData.token}`)
+      } else {
+        // Relay mode - connect to client WebSocket
+        ws = new WebSocket(`${connectionData.ws.client}?sessionId=${connectionData.sessionId}&token=${connectionData.token}`)
+      }
       
       ws.onopen = () => {
         setConnectionInfo(connectionData)

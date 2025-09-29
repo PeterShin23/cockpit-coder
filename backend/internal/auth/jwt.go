@@ -3,11 +3,11 @@ package auth
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	"net/http"
 )
 
 var jwtSecret = []byte("change_me")
@@ -17,19 +17,44 @@ func SetJWTSecret(secret string) {
 	jwtSecret = []byte(secret)
 }
 
-// Claims represents the JWT claims structure
+// Claims represents the JWT claims structure for local sessions
 type Claims struct {
 	SessionID string `json:"sid"`
-	ExpiresAt int64  `json:"exp"`
-	IssuedAt  int64  `json:"iat"`
+	jwt.RegisteredClaims
+}
+
+// RelayClaims represents the JWT claims structure for relay sessions
+type RelayClaims struct {
+	SID string `json:"sid"`
+	TID string `json:"tid"`
+	jwt.RegisteredClaims
 }
 
 // GenerateToken creates a new JWT token for a session
 func GenerateToken(sessionID string) (string, error) {
 	claims := Claims{
 		SessionID: sessionID,
-		ExpiresAt: time.Now().Add(24 * time.Hour).Unix(),
-		IssuedAt:  time.Now().Unix(),
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(jwtSecret)
+}
+
+// GenerateRelayToken creates a new JWT token compatible with the relay service
+func GenerateRelayToken(sessionID, tenantID string, ttlSeconds int64) (string, error) {
+	exp := time.Now().Add(time.Duration(ttlSeconds) * time.Second)
+	
+	claims := RelayClaims{
+		SID: sessionID,
+		TID: tenantID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(exp),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)

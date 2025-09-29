@@ -11,190 +11,187 @@ import (
 	"time"
 
 	"github.com/creack/pty"
-	"github.com/PeterShin23/cockpit-coder/backend/internal/session"
 )
 
-// Manager handles PTY operations
-type Manager struct {
-	sessions map[string]*PtySession
+// Proc represents a running process
+type Proc interface {
+	Write([]byte) (int, error)
+	Resize(cols, rows int) error
+	Close() error
+	Stream() <-chan []byte
+	Done() <-chan State
+}
+
+// State represents the final state of a process
+type State struct {
+	ExitCode int
+	Err      error
+	Duration time.Duration
+}
+
+// Manager interface for PTY operations
+type Manager interface {
+	Start(ctx context.Context, cmd string, args []string, cwd string, env []string) (Proc, error)
+}
+
+// managerImpl implements the Manager interface
+type managerImpl struct {
+	sessions map[string]*ptySession
 	mu       sync.RWMutex
 }
 
-// PtySession represents a PTY session
-type PtySession struct {
-	ID        string
-	Cmd       *exec.Cmd
-	Pty       *os.File
-	Size      *pty.Winsize
-	Output    []byte
-	Done      chan struct{}
-	Cancel    context.CancelFunc
+// ptySession implements the Proc interface
+type ptySession struct {
+	ID       string
+	Cmd      *exec.Cmd
+	PtyFile  *os.File
+	Size     *pty.Winsize
+	StreamCh chan []byte
+	DoneCh   chan State
+	Cancel   context.CancelFunc
+	start    time.Time
 }
 
 // NewManager creates a new PTY manager
-func NewManager() *Manager {
-	return &Manager{
-		sessions: make(map[string]*PtySession),
+func NewManager() Manager {
+	return &managerImpl{
+		sessions: make(map[string]*ptySession),
 	}
 }
 
-// RunCommand runs a command in the specified working directory
-func (m *Manager) RunCommand(repo, cmd, cwd string, timeout time.Duration) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
+// Start creates and starts a new PTY process
+func (m *managerImpl) Start(ctx context.Context, cmd string, args []string, cwd string, env []string) (Proc, error) {
 	// Create command
-	fullCmd := exec.CommandContext(ctx, "sh", "-c", cmd)
+	fullCmd := exec.CommandContext(ctx, cmd, args...)
 	fullCmd.Dir = cwd
-
-	// Start the command
-	output, err := fullCmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("command failed: %v, output: %s", err, string(output))
+	if env != nil {
+		fullCmd.Env = append(os.Environ(), env...)
 	}
-
-	return output, nil
-}
-
-// CreatePtySession creates a new PTY session
-func (m *Manager) CreatePtySession(repo, cmd string) (string, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Create command
-	fullCmd := exec.CommandContext(ctx, "sh", "-c", cmd)
-	fullCmd.Dir = repo
 
 	// Create PTY
 	ptyFile, err := pty.Start(fullCmd)
 	if err != nil {
-		cancel()
-		return "", fmt.Errorf("failed to create PTY: %v", err)
+		return nil, fmt.Errorf("failed to create PTY: %v", err)
 	}
 
-	sessionID := generateID()
-	session := &PtySession{
-		ID:     sessionID,
-		Cmd:    fullCmd,
-		Pty:    ptyFile,
-		Size:   &pty.Winsize{Cols: 80, Rows: 24},
-		Output: make([]byte, 0),
-		Done:   make(chan struct{}),
-		Cancel: cancel,
+	// Create session
+	session := &ptySession{
+		ID:       generateID(),
+		Cmd:      fullCmd,
+		PtyFile:  ptyFile,
+		Size:     &pty.Winsize{Cols: 80, Rows: 24},
+		StreamCh: make(chan []byte, 1000),
+		DoneCh:   make(chan State, 1),
+		start:    time.Now(),
 	}
 
 	// Start reading from PTY
-	go m.readFromPty(session)
+	go session.readFromPty()
 
+	// Store session
 	m.mu.Lock()
-	m.sessions[sessionID] = session
+	m.sessions[session.ID] = session
 	m.mu.Unlock()
 
-	return sessionID, nil
+	return session, nil
 }
 
-// readFromPty reads data from PTY and stores it
-func (m *Manager) readFromPty(session *PtySession) {
-	defer close(session.Done)
-	defer session.Pty.Close()
+// readFromPty reads data from PTY and streams it
+func (s *ptySession) readFromPty() {
+	defer close(s.StreamCh)
+	defer close(s.DoneCh)
+	defer s.PtyFile.Close()
 
-	reader := bufio.NewReader(session.Pty)
+	reader := bufio.NewReader(s.PtyFile)
 	for {
-		select {
-		case <-session.Done:
-			return
-		default:
-			line, err := reader.ReadBytes('\n')
-			if err != nil {
-				if err != io.EOF {
-					session.Output = append(session.Output, []byte(fmt.Sprintf("\nError reading PTY: %v\n", err))...)
-				}
-				return
+		// Read with timeout
+		s.PtyFile.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			if os.IsTimeout(err) {
+				continue
 			}
-			session.Output = append(session.Output, line...)
+			if err != io.EOF {
+				select {
+				case s.StreamCh <- []byte(fmt.Sprintf("\nError reading PTY: %v\n", err)):
+				default:
+				}
+			}
+			// Process finished
+			s.handleProcessExit()
+			return
+		}
+		select {
+		case s.StreamCh <- line:
+		default:
+			// Channel full, drop data
 		}
 	}
 }
 
-// WriteToPty writes data to a PTY session
-func (m *Manager) WriteToPty(sessionID string, data []byte) error {
-	m.mu.RLock()
-	session, exists := m.sessions[sessionID]
-	m.mu.RUnlock()
-
-	if !exists {
-		return fmt.Errorf("session not found")
+// handleProcessExit handles process completion
+func (s *ptySession) handleProcessExit() {
+	duration := time.Since(s.start)
+	
+	// Get exit code
+	exitCode := 0
+	if err := s.Cmd.Wait(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = -1
+		}
 	}
 
-	_, err := session.Pty.Write(data)
-	return err
+	state := State{
+		ExitCode: exitCode,
+		Err:      nil,
+		Duration: duration,
+	}
+
+	select {
+	case s.DoneCh <- state:
+	default:
+	}
 }
 
-// ResizePty resizes a PTY session
-func (m *Manager) ResizePty(sessionID string, cols, rows uint16) error {
-	m.mu.RLock()
-	session, exists := m.sessions[sessionID]
-	m.mu.RUnlock()
-
-	if !exists {
-		return fmt.Errorf("session not found")
-	}
-
-	session.Size = &pty.Winsize{Cols: cols, Rows: rows}
-	return pty.Setsize(session.Pty, session.Size)
+// Write writes data to the PTY
+func (s *ptySession) Write(data []byte) (int, error) {
+	return s.PtyFile.Write(data)
 }
 
-// GetPtyOutput retrieves the output of a PTY session
-func (m *Manager) GetPtyOutput(sessionID string) ([]byte, error) {
-	m.mu.RLock()
-	session, exists := m.sessions[sessionID]
-	m.mu.RUnlock()
-
-	if !exists {
-		return nil, fmt.Errorf("session not found")
-	}
-
-	return session.Output, nil
+// Resize resizes the PTY
+func (s *ptySession) Resize(cols, rows int) error {
+	s.Size = &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)}
+	return pty.Setsize(s.PtyFile, s.Size)
 }
 
-// ClosePtySession closes a PTY session
-func (m *Manager) ClosePtySession(sessionID string) error {
-	m.mu.Lock()
-	session, exists := m.sessions[sessionID]
-	m.mu.Unlock()
-
-	if !exists {
-		return fmt.Errorf("session not found")
-	}
-
+// Close closes the PTY session
+func (s *ptySession) Close() error {
 	// Cancel the context to stop the command
-	session.Cancel()
-
-	// Close the PTY
-	if session.Pty != nil {
-		session.Pty.Close()
+	if s.Cmd != nil && s.Cmd.Process != nil {
+		s.Cmd.Process.Kill()
 	}
-
-	// Remove from sessions
-	m.mu.Lock()
-	delete(m.sessions, sessionID)
-	m.mu.Unlock()
+	
+	// Close the PTY file
+	if s.PtyFile != nil {
+		s.PtyFile.Close()
+	}
 
 	return nil
 }
 
-// ListPtySessions returns all active PTY sessions
-func (m *Manager) ListPtySessions() []string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+// Stream returns the output stream channel
+func (s *ptySession) Stream() <-chan []byte {
+	return s.StreamCh
+}
 
-	sessions := make([]string, 0, len(m.sessions))
-	for id := range m.sessions {
-		sessions = append(sessions, id)
-	}
-	return sessions
+// Done returns the completion channel
+func (s *ptySession) Done() <-chan State {
+	return s.DoneCh
 }
 
 // generateID creates a random ID
 func generateID() string {
-	return fmt.Sprintf("%d", time.Now().UnixNano())
+	return fmt.Sprintf("pty_%d_%d", time.Now().UnixNano(), os.Getpid())
 }

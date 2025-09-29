@@ -22,7 +22,16 @@ export class WebSocketClient {
         throw new Error('No connection info available')
       }
 
-      const url = `${this.endpoint}?sessionId=${connectionInfo.sessionId}&token=${connectionInfo.token}`
+      // Determine which WebSocket URL to use based on connection info
+      let url: string;
+      if (connectionInfo.ws.host && connectionInfo.ws.client) {
+        // Relay mode - use client WebSocket with resumeSeq support
+        const resumeSeq = 0; // TODO: Implement resume sequence logic
+        url = `${connectionInfo.ws.client}?sessionId=${connectionInfo.sessionId}&token=${connectionInfo.token}&resumeSeq=${resumeSeq}`
+      } else {
+        // Local mode - use the provided endpoint
+        url = `${this.endpoint}?sessionId=${connectionInfo.sessionId}&token=${connectionInfo.token}`
+      }
       
       this.ws = new WebSocket(url)
 
